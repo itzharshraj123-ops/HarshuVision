@@ -1,49 +1,87 @@
 package zo.ro.whatsappreplybot.helpers;
 
-import android.annotation.SuppressLint;
 import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
+import android.util.Log;
 
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.util.ArrayList;
 import java.util.List;
 
-import zo.ro.whatsappreplybot.models.Message;
+import zo.ro.whatsappreplybot.models.ChatMessage;
+import zo.ro.whatsappreplybot.models.ChatSession;
 
+/**
+ * WhatsAppMessageHandler — updated to use new DatabaseHelper singleton.
+ * Old methods (insertMessage, deleteOldMessages, getChatHistoryBySender,
+ * getAllMessagesBySender) replaced with new DB API.
+ */
 public class WhatsAppMessageHandler {
 
-    private final DatabaseHelper dbHelper;
+    private static final String TAG = "WAMsgHandler";
+
+    private final DatabaseHelper db;
+    private final MemoryManager  memory;
 
     public WhatsAppMessageHandler(Context context) {
-        dbHelper = new DatabaseHelper(context);
+        db     = DatabaseHelper.getInstance(context);
+        memory = MemoryManager.getInstance(context);
     }
 
-//    ----------------------------------------------------------------------------------------------
+    /**
+     * Save an incoming message + AI reply to the database.
+     */
+    public void saveMessage(String senderName, String messageText,
+                            String aiReply, String platform) {
+        try {
+            long contactId      = db.getOrCreateContact(senderName, platform);
+            ChatSession session = db.getOrCreateActiveSession(
+                    contactId, memory.getMaxMessages());
 
-    public void handleIncomingMessage(String sender, String message, String reply) {
-        @SuppressLint("SimpleDateFormat") String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
-        dbHelper.insertMessage(sender, message, timestamp, reply);
-        dbHelper.deleteOldMessages(); // Clean up old messages
+            ChatMessage msg = new ChatMessage(
+                    session.getId(),
+                    contactId,
+                    senderName,
+                    messageText,
+                    aiReply,
+                    System.currentTimeMillis(),
+                    platform);
+
+            db.saveMessage(msg);
+            Log.d(TAG, "Message saved for: " + senderName);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save message", e);
+        }
     }
 
-//    ----------------------------------------------------------------------------------------------
-
-    public void getMessagesHistory(String sender, OnMessagesRetrievedListener listener) {
-        new Thread(() -> {
-            List<Message> messages = dbHelper.getChatHistoryBySender(sender);
-            listener.onMessagesRetrieved(messages);
-        }).start();
+    /**
+     * Get recent chat history for a sender (for AI context).
+     */
+    public List<ChatMessage> getChatHistory(String senderName, String platform) {
+        try {
+            long contactId      = db.getOrCreateContact(senderName, platform);
+            ChatSession session = db.getOrCreateActiveSession(
+                    contactId, memory.getMaxMessages());
+            return db.getRecentMessages(session.getId(), memory.getHistorySize());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to get history", e);
+            return new ArrayList<>();
+        }
     }
 
-    public void getAllMessagesBySender(String sender, OnMessagesRetrievedListener listener) {
-        new Thread(() -> {
-            List<Message> messages = dbHelper.getAllMessagesBySender(sender);
-            new Handler(Looper.getMainLooper()).post(() -> listener.onMessagesRetrieved(messages));
-        }).start();
-    }
-
-    public interface OnMessagesRetrievedListener {
-        void onMessagesRetrieved(List<Message> messages);
+    /**
+     * Get all messages for a sender across all sessions.
+     */
+    public List<ChatMessage> getAllMessages(String senderName, String platform) {
+        try {
+            long contactId      = db.getOrCreateContact(senderName, platform);
+            List<ChatSession> sessions = db.getSessionsForContact(contactId);
+            List<ChatMessage> all = new ArrayList<>();
+            for (ChatSession s : sessions) {
+                all.addAll(db.getMessagesForSession(s.getId()));
+            }
+            return all;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to get all messages", e);
+            return new ArrayList<>();
+        }
     }
 }
