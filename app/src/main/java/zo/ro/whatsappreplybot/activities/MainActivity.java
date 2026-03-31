@@ -1,64 +1,95 @@
 package zo.ro.whatsappreplybot.activities;
 
+import android.app.AlertDialog;
 import android.content.Intent;
-import android.content.res.ColorStateList;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.content.ContextCompat;
-import androidx.core.view.ViewCompat;
-import androidx.core.widget.TextViewCompat;
 
-import zo.ro.whatsappreplybot.R;
-import zo.ro.whatsappreplybot.databinding.ActivityMainBinding;
-import zo.ro.whatsappreplybot.helpers.NotificationHelper;
+import zo.ro.whatsappreplybot.helpers.DatabaseHelper;
+import zo.ro.whatsappreplybot.helpers.MemoryManager;
 
+/**
+ * HarshuVision — MainActivity
+ *
+ * Buttons:
+ *  ① Grant Notification Access
+ *  ② Chat History
+ *  ③ Admin Commands (Engineering Panel)
+ *  ④ Bot Settings (existing)
+ */
 public class MainActivity extends AppCompatActivity {
 
-    private ActivityMainBinding binding;
-    private boolean isSettingsButton;
+    private MemoryManager memory;
+    private TextView tvStatus;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        binding = ActivityMainBinding.inflate(getLayoutInflater());
-        setContentView(binding.getRoot());
+        setContentView(getResources().getIdentifier("activity_main", "layout", getPackageName()));
 
-        if (NotificationHelper.isNotificationServicePermissionGranted(this)) {
-            setSettingsButton();
-        }
+        memory = MemoryManager.getInstance(this);
+        DatabaseHelper.getInstance(this); // init DB early
 
-        binding.permissionAndSettingsBtn.setOnClickListener(v -> {
-            if (isSettingsButton) {
-                startActivity(new Intent(this, BotSettingsActivity.class));
-            } else {
-                startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
-            }
-        });
+        initViews();
     }
 
-    //--------------------------------------------------------------------------------------------------
     @Override
     protected void onResume() {
         super.onResume();
+        updateStatusUI();
+    }
 
-        if (NotificationHelper.isNotificationServicePermissionGranted(this)) {
-            setSettingsButton();
+    private void initViews() {
+        tvStatus = findViewById(resId("tv_status"));
+
+        // ── Notification Access ────────────────────────────────────────────
+        Button btnNotif = findViewById(resId("btn_notification_access"));
+        if (btnNotif != null) {
+            btnNotif.setOnClickListener(v ->
+                    startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
+        }
+
+        // ── Chat History ───────────────────────────────────────────────────
+        Button btnHistory = findViewById(resId("btn_chat_history"));
+        if (btnHistory != null) {
+            btnHistory.setOnClickListener(v ->
+                    startActivity(new Intent(this, ChatHistoryActivity.class)));
+        }
+
+        // ── Admin Commands ─────────────────────────────────────────────────
+        Button btnAdmin = findViewById(resId("btn_admin_commands"));
+        if (btnAdmin != null) {
+            btnAdmin.setOnClickListener(v ->
+                    startActivity(new Intent(this, AdminCommandsActivity.class)));
+        }
+
+        // ── Bot Settings ───────────────────────────────────────────────────
+        Button btnSettings = findViewById(resId("btn_bot_settings"));
+        if (btnSettings != null) {
+            btnSettings.setOnClickListener(v ->
+                    startActivity(new Intent(this, BotSettingsActivity.class)));
         }
     }
 
-//    ----------------------------------------------------------------------------------------------
+    private void updateStatusUI() {
+        if (tvStatus == null) return;
+        boolean keyValid = memory.isGroqKeyValid();
+        boolean autoOn   = memory.isAutoReplyEnabled();
 
-    private void setSettingsButton() {
-        isSettingsButton = true;
-        binding.permissionAndSettingsBtn.setText(R.string.bot_settings);
-        binding.permissionAndSettingsBtn.setAllCaps(true);
-        binding.permissionAndSettingsBtn.setCompoundDrawablesWithIntrinsicBounds(R.drawable.settings_24, 0, 0, 0);
-        int tintColor = ContextCompat.getColor(this, R.color.white);
-        TextViewCompat.setCompoundDrawableTintList(binding.permissionAndSettingsBtn, ColorStateList.valueOf(tintColor));
-        ColorStateList backgroundTint = ColorStateList.valueOf(getColor(R.color.teal));
-        ViewCompat.setBackgroundTintList(binding.permissionAndSettingsBtn, backgroundTint);
-        binding.shortInfoTV.setText(getString(R.string.manage_bot_settings));
+        String status = "🤖 HarshuVision\n"
+                + (keyValid ? "✅ Groq API: Connected\n" : "❌ Groq API key not set → Go to Admin Commands\n")
+                + (autoOn   ? "✅ Auto-reply: ON\n"      : "⭕ Auto-reply: OFF\n")
+                + "📊 Context window: " + memory.getMaxMessages() + " msgs max";
+        tvStatus.setText(status);
+    }
+
+    private int resId(String name) {
+        return getResources().getIdentifier(name, "id", getPackageName());
     }
 }
