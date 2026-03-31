@@ -1,10 +1,7 @@
 package zo.ro.whatsappreplybot.apis;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.util.Log;
-
-import androidx.annotation.NonNull;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -20,186 +17,117 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
-import okhttp3.ResponseBody;
-import zo.ro.whatsappreplybot.R;
+import zo.ro.whatsappreplybot.helpers.DatabaseHelper;
+import zo.ro.whatsappreplybot.helpers.MemoryManager;
 import zo.ro.whatsappreplybot.helpers.WhatsAppMessageHandler;
-import zo.ro.whatsappreplybot.models.Message;
+import zo.ro.whatsappreplybot.models.ChatMessage;
+import zo.ro.whatsappreplybot.models.ChatSession;
 
 public class ChatGPTReplyGenerator {
 
-    private static final String TAG = "MADARA";
-    private static final String API_URL = "https://api.openai.com/v1/chat/completions";
-    private final String API_KEY;
-    private final String LLM_MODEL;
-    private final WhatsAppMessageHandler messageHandler;
-    private List<Message> messagesList;
-    private final String defaultReplyMessage;
-    private final String aiReplyLanguage;
+    private static final String TAG      = "ChatGPTReply";
+    private static final String ENDPOINT = "https://api.openai.com/v1/chat/completions";
+    private static final String MODEL    = "gpt-3.5-turbo";
 
-    public ChatGPTReplyGenerator(Context context, SharedPreferences sharedPreferences, WhatsAppMessageHandler whatsAppMessageHandler) {
-        this.messageHandler = whatsAppMessageHandler;
-        API_KEY = sharedPreferences.getString("api_key", "not-set").trim();
-        LLM_MODEL = sharedPreferences.getString("llm_model", "gpt-4o-mini");
-        defaultReplyMessage = sharedPreferences.getString("default_reply_message", context.getString(R.string.default_bot_message));
-        aiReplyLanguage = sharedPreferences.getString("ai_reply_language", "English");
+    public interface ReplyCallback {
+        void onReply(String reply);
+        void onError(String error);
     }
 
-    public void generateReply(String sender, String message, OnReplyGeneratedListener listener) {
+    private final Context context;
+    private final String  apiKey;
+    private final OkHttpClient client;
+    private final DatabaseHelper db;
+    private final MemoryManager  memory;
 
-        new Thread(() -> {
+    public ChatGPTReplyGenerator(Context context, String apiKey) {
+        this.context = context;
+        this.apiKey  = apiKey;
+        this.db      = DatabaseHelper.getInstance(context);
+        this.memory  = MemoryManager.getInstance(context);
+        this.client  = new OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .build();
+    }
 
-            JSONObject container = new JSONObject();
-            JSONArray httpRequestMessages = new JSONArray();
+    public void generateReply(String sender, String message, ReplyCallback callback) {
+        try {
+            long contactId      = db.getOrCreateContact(sender, "whatsapp");
+            ChatSession session = db.getOrCreateActiveSession(contactId, memory.getMaxMessages());
+            List<ChatMessage> history = db.getRecentMessages(session.getId(), memory.getHistorySize());
 
-            JSONObject systemRole = new JSONObject();
-            JSONObject userRole1 = new JSONObject();
-            JSONObject userRole2 = new JSONObject();
+            JSONArray messages = new JSONArray();
 
-            messageHandler.getMessagesHistory(sender, messages -> {
+            JSONObject system = new JSONObject();
+            system.put("role", "system");
+            system.put("content", db.buildAdminMemoryBlock() + "\n" + db.buildActiveRulesBlock());
+            messages.put(system);
 
-                messagesList = messages;
+            for (ChatMessage hist : history) {
+                JSONObject u = new JSONObject();
+                u.put("role", "user");
+                u.put("content", hist.getSenderName() + ": " + hist.getMessageText());
+                messages.put(u);
+                if (hist.getAiReply() != null && !hist.getAiReply().isEmpty()) {
+                    JSONObject a = new JSONObject();
+                    a.put("role", "assistant");
+                    a.put("content", hist.getAiReply());
+                    messages.put(a);
+                }
+            }
 
-                StringBuilder chatHistory = getChatHistory();
+            JSONObject userMsg = new JSONObject();
+            userMsg.put("role", "user");
+            userMsg.put("content", sender + ": " + message);
+            messages.put(userMsg);
 
-                try {
+            JSONObject body = new JSONObject();
+            body.put("model", MODEL);
+            body.put("messages", messages);
+            body.put("max_tokens", 512);
 
-                    systemRole.put("role", "system");
-                    systemRole.put(
-                            "content", "You are a WhatsApp auto-reply bot. " +
-                                    "Your task is to read the provided previous chat history and reply to the most recent incoming message. " +
-                                    "Always respond in " + aiReplyLanguage + ". Be polite, context-aware, and ensure your replies are relevant to the conversation."
-                    );
+            RequestBody reqBody = RequestBody.create(
+                    body.toString(),
+                    MediaType.parse("application/json; charset=utf-8"));
 
-                    userRole1.put("role", "user");
+            Request request = new Request.Builder()
+                    .url(ENDPOINT)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(reqBody)
+                    .build();
 
-                    if (chatHistory.toString().isEmpty()) {
-                        userRole1.put("content", "There are no any previous chat history. This is the first message from the sender.");
-                    } else {
-                        userRole1.put("content", "Previous chat history: " + chatHistory);
+            client.newCall(request).enqueue(new Callback() {
+                @Override
+                public void onFailure(Call call, IOException e) {
+                    callback.onError("Network error: " + e.getMessage());
+                }
+
+                @Override
+                public void onResponse(Call call, Response response) throws IOException {
+                    String bodyStr = response.body() != null ? response.body().string() : "";
+                    if (!response.isSuccessful()) {
+                        callback.onError("API error " + response.code());
+                        return;
                     }
-
-                    userRole2.put("role", "user");
-                    userRole2.put("content", "Most recent message from the sender (" + sender + "): " + message);
-
-
-                    httpRequestMessages.put(systemRole);
-                    httpRequestMessages.put(userRole1);
-                    httpRequestMessages.put(userRole2);
-
-                    container.put("model", LLM_MODEL);
-                    container.put("messages", httpRequestMessages);
-//                container.put("temperature", 0.7);
-
-                    OkHttpClient client = new OkHttpClient.Builder()
-                            .connectTimeout(30, TimeUnit.SECONDS)  // Set connect timeout
-                            .readTimeout(30, TimeUnit.SECONDS)     // Set read timeout
-                            .writeTimeout(30, TimeUnit.SECONDS)    // Set write timeout
-                            .build();
-
-                    MediaType JSON = MediaType.get("application/json; charset=utf-8");
-
-                    String jsonBody = container.toString();
-
-                    RequestBody requestBody = RequestBody.create(jsonBody, JSON);
-
-                    Request request = new Request.Builder()
-                            .url(API_URL)
-                            .addHeader("Content-Type", "application/json")
-                            .addHeader("Authorization", "Bearer " + API_KEY)
-                            .post(requestBody)
-                            .build();
-
-                    client.newCall(request).enqueue(new Callback() {
-
-                        @Override
-                        public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                            Log.e(TAG, "onFailure: ", e);
-                            listener.onReplyGenerated(defaultReplyMessage);
-                        }
-
-                        @Override
-                        public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-
-                            if (!response.isSuccessful()) {
-                                listener.onReplyGenerated(defaultReplyMessage);
-                                Log.d(TAG, "onResponse: " + response.code());
-                                return;
-                            }
-
-                            ResponseBody body = response.body();
-
-                            if (body != null) {
-                                String responseData = body.string();
-                                String chatGPTReply = parseResponse(responseData);
-
-                                if (chatGPTReply != null) {
-                                    listener.onReplyGenerated(chatGPTReply);
-                                } else {
-                                    Log.d(TAG, "onResponse: chatGPTReply is null");
-                                    listener.onReplyGenerated(defaultReplyMessage);
-                                    Log.d(TAG, "onResponse: " + responseData);
-                                }
-                            } else {
-                                Log.e(TAG, "onResponse: Response body is null");
-                                listener.onReplyGenerated(defaultReplyMessage);
-                            }
-                        }
-                    });
-                } catch (Exception e) {
-                    Log.e(TAG, "generateReply: ", e);
-                    listener.onReplyGenerated(defaultReplyMessage);
+                    try {
+                        JSONObject json = new JSONObject(bodyStr);
+                        String reply = json.getJSONArray("choices")
+                                .getJSONObject(0)
+                                .getJSONObject("message")
+                                .getString("content")
+                                .trim();
+                        callback.onReply(reply);
+                    } catch (Exception e) {
+                        callback.onError("Parse error: " + e.getMessage());
+                    }
                 }
             });
-        }).start();
-    }
 
-//    ----------------------------------------------------------------------------------------------
-
-    private @NonNull StringBuilder getChatHistory() {
-        StringBuilder chatHistory = new StringBuilder();
-
-        Log.d(TAG, "getChatHistory: " + messagesList.size());
-
-        if (messagesList != null && !messagesList.isEmpty()) {
-
-            for (Message msg : messagesList) {
-
-                String senderName = msg.getSender();
-                String senderMessage = msg.getMessage();
-                String senderMessageTimestamp = msg.getTimestamp();
-                String myReplyToSenderMessage = msg.getReply();
-
-                chatHistory.append(senderName).append(": ").append(senderMessage);
-                chatHistory.append("\n");
-                chatHistory.append("Time: ").append(senderMessageTimestamp);
-                chatHistory.append("\n");
-                chatHistory.append("My reply: ").append(myReplyToSenderMessage);
-                chatHistory.append("\n\n");
-            }
-        }
-        return chatHistory;
-    }
-
-//    ----------------------------------------------------------------------------------------------
-
-    private String parseResponse(String responseData) {
-        try {
-            JSONObject jsonObject = new JSONObject(responseData);
-            JSONArray choicesArray = jsonObject.getJSONArray("choices");
-            if (choicesArray.length() > 0) {
-                JSONObject choice = choicesArray.getJSONObject(0);
-                JSONObject message = choice.getJSONObject("message");
-                return message.getString("content");
-            }
         } catch (Exception e) {
-            Log.e(TAG, "parseResponse: ", e);
+            Log.e(TAG, "Error", e);
+            callback.onError("Error: " + e.getMessage());
         }
-        return null;
-    }
-
-//    ----------------------------------------------------------------------------------------------
-
-    public interface OnReplyGeneratedListener {
-        void onReplyGenerated(String reply);
     }
 }
