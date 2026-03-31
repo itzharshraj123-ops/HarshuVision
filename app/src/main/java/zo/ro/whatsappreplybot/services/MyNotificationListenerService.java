@@ -1,7 +1,8 @@
 package zo.ro.whatsappreplybot.services;
 
 import android.app.Notification;
-import android.content.pm.PackageManager;
+import android.app.RemoteInput;
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -14,32 +15,13 @@ import java.util.List;
 import zo.ro.whatsappreplybot.apis.GroqReplyGenerator;
 import zo.ro.whatsappreplybot.helpers.DatabaseHelper;
 import zo.ro.whatsappreplybot.helpers.MemoryManager;
-import zo.ro.whatsappreplybot.helpers.NotificationHelper;
 import zo.ro.whatsappreplybot.models.ChatMessage;
 import zo.ro.whatsappreplybot.models.ChatSession;
 
-/**
- * HarshuVision — MyNotificationListenerService
- *
- * Listens to notifications from:
- *   - com.whatsapp              (WhatsApp)
- *   - com.whatsapp.w4b          (WhatsApp Business)
- *   - org.telegram.messenger    (Telegram)
- *
- * Flow:
- *   1. Notification arrives → extract sender + message + platform
- *   2. Get/create contact in DB
- *   3. Get/create active session (auto-rotates at 75%)
- *   4. Load Harshu Memory+ + Active Rules + Chat History
- *   5. Send to Groq → get smart reply
- *   6. Save to DB (sender / message / ai_reply)
- *   7. Auto-reply via notification action
- */
 public class MyNotificationListenerService extends NotificationListenerService {
 
     private static final String TAG = "HarshuListener";
 
-    // Supported packages
     private static final String PKG_WHATSAPP    = "com.whatsapp";
     private static final String PKG_WA_BUSINESS = "com.whatsapp.w4b";
     private static final String PKG_TELEGRAM    = "org.telegram.messenger";
@@ -59,7 +41,7 @@ public class MyNotificationListenerService extends NotificationListenerService {
     public void onNotificationPosted(StatusBarNotification sbn) {
         if (!memory.isAutoReplyEnabled()) return;
         if (!memory.isGroqKeyValid()) {
-            Log.w(TAG, "Groq API key not set or invalid — skipping");
+            Log.w(TAG, "Groq API key not set — skipping");
             return;
         }
 
@@ -67,92 +49,80 @@ public class MyNotificationListenerService extends NotificationListenerService {
         if (!isSupportedPackage(pkg)) return;
 
         String platform = resolvePlatform(pkg);
-        Notification notification = sbn.getNotification();
-        Bundle extras = notification.extras;
-
+        Bundle extras   = sbn.getNotification().extras;
         if (extras == null) return;
 
-        // Extract sender and message text
-        String senderName = extractText(extras, Notification.EXTRA_TITLE);
+        String senderName  = extractText(extras, Notification.EXTRA_TITLE);
         String messageText = extractText(extras, Notification.EXTRA_TEXT);
 
         if (senderName == null || senderName.isEmpty()) return;
         if (messageText == null || messageText.isEmpty()) return;
-
-        // Skip group notifications (contain "@" in title or have multiple senders listed)
         if (senderName.contains(":") || messageText.startsWith("Messages from")) return;
 
-        Log.d(TAG, "New message from [" + senderName + "] on " + platform + ": " + messageText);
+        Log.d(TAG, "Message from [" + senderName + "] on " + platform + ": " + messageText);
 
-        // ── DB: Get/create contact ─────────────────────────────────────────
-        long contactId = db.getOrCreateContact(senderName, platform);
-
-        // ── DB: Get/create active session ──────────────────────────────────
+        long contactId      = db.getOrCreateContact(senderName, platform);
         ChatSession session = db.getOrCreateActiveSession(contactId, memory.getMaxMessages());
 
-        // ── Build AI context ───────────────────────────────────────────────
-        String adminMemory   = db.buildAdminMemoryBlock();
-        String activeRules   = db.buildActiveRulesBlock();
+        String adminMemory        = db.buildAdminMemoryBlock();
+        String activeRules        = db.buildActiveRulesBlock();
         List<ChatMessage> history = db.getRecentMessages(session.getId(), memory.getHistorySize());
 
-        // ── Generate reply via Groq ────────────────────────────────────────
-        GroqReplyGenerator groq = new GroqReplyGenerator(memory.getGroqApiKey());
-
-        // Capture notification action for auto-reply
-        Notification.Action[] actions = notification.actions;
-
-        String finalSenderName = senderName;
-        String finalMessageText = messageText;
+        Notification.Action[] actions = sbn.getNotification().actions;
         long sessionId = session.getId();
 
-        groq.generateReply(senderName, messageText, adminMemory, activeRules, history,
+        new GroqReplyGenerator(memory.getGroqApiKey()).generateReply(
+                senderName, messageText, adminMemory, activeRules, history,
                 new GroqReplyGenerator.ReplyCallback() {
                     @Override
                     public void onReply(String reply) {
-                        Log.d(TAG, "Reply generated: " + reply);
+                        Log.d(TAG, "Reply: " + reply);
 
-                        // ── Save to DB ────────────────────────────────────
-                        ChatMessage chatMsg = new ChatMessage(
-                                sessionId,
-                                contactId,
-                                finalSenderName,
-                                finalMessageText,
-                                reply,
-                                System.currentTimeMillis(),
-                                platform);
-                        db.saveMessage(chatMsg);
+                        ChatMessage msg = new ChatMessage(
+                                sessionId, contactId, senderName,
+                                messageText, reply,
+                                System.currentTimeMillis(), platform);
+                        db.saveMessage(msg);
 
-                        // ── Auto-reply via notification after delay ───────
-                        int delayMs = memory.getReplyDelayMs();
-                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                            sendReplyViaNotification(actions, reply, sbn.getKey());
-                        }, delayMs);
+                        new Handler(Looper.getMainLooper()).postDelayed(() ->
+                                sendReply(actions, reply, sbn.getKey()),
+                                memory.getReplyDelayMs());
                     }
 
                     @Override
                     public void onError(String error) {
                         Log.e(TAG, "Groq error: " + error);
-
-                        // Save the message without AI reply so history is preserved
-                        ChatMessage chatMsg = new ChatMessage(
-                                sessionId,
-                                contactId,
-                                finalSenderName,
-                                finalMessageText,
-                                "[AI error: " + error + "]",
-                                System.currentTimeMillis(),
-                                platform);
-                        db.saveMessage(chatMsg);
+                        ChatMessage msg = new ChatMessage(
+                                sessionId, contactId, senderName,
+                                messageText, "[AI error: " + error + "]",
+                                System.currentTimeMillis(), platform);
+                        db.saveMessage(msg);
                     }
                 });
     }
 
-    @Override
-    public void onNotificationRemoved(StatusBarNotification sbn) {
-        // Not used currently
-    }
+    private void sendReply(Notification.Action[] actions, String replyText, String notifKey) {
+        if (actions == null || replyText == null || replyText.isEmpty()) return;
 
-    // ── Helpers ────────────────────────────────────────────────────────────
+        for (Notification.Action action : actions) {
+            RemoteInput[] remoteInputs = action.getRemoteInputs();
+            if (remoteInputs != null && remoteInputs.length > 0) {
+                try {
+                    Intent intent = new Intent();
+                    Bundle results = new Bundle();
+                    results.putCharSequence(remoteInputs[0].getResultKey(), replyText);
+                    RemoteInput.addResultsToIntent(remoteInputs, intent, results);
+                    action.actionIntent.send(getApplicationContext(), 0, intent);
+                    Log.d(TAG, "Reply sent: " + replyText);
+                    cancelNotification(notifKey);
+                    return;
+                } catch (Exception e) {
+                    Log.e(TAG, "Reply failed", e);
+                }
+            }
+        }
+        Log.w(TAG, "No reply action found");
+    }
 
     private boolean isSupportedPackage(String pkg) {
         return PKG_WHATSAPP.equals(pkg)
@@ -171,39 +141,5 @@ public class MyNotificationListenerService extends NotificationListenerService {
     private String extractText(Bundle extras, String key) {
         CharSequence cs = extras.getCharSequence(key);
         return cs != null ? cs.toString().trim() : null;
-    }
-
-    /**
-     * Send a reply via notification's RemoteInput action (direct reply).
-     * WhatsApp/Telegram both support this via their reply action.
-     */
-    private void sendReplyViaNotification(Notification.Action[] actions,
-                                           String replyText, String notificationKey) {
-        if (actions == null || replyText == null || replyText.isEmpty()) return;
-
-        for (Notification.Action action : actions) {
-            if (action.getRemoteInputs() != null && action.getRemoteInputs().length > 0) {
-                try {
-                    Bundle results = new Bundle();
-                    results.putCharSequence(
-                            action.getRemoteInputs()[0].getResultKey(),
-                            replyText);
-
-                    android.app.RemoteInput.addResultsToIntent(
-                            action.getRemoteInputs(), action.actionIntent.getIntent(), results);
-                    action.actionIntent.send(getApplicationContext(), 0,
-                            action.actionIntent.getIntent());
-
-                    Log.d(TAG, "Auto-reply sent: " + replyText);
-
-                    // Cancel the notification after replying
-                    cancelNotification(notificationKey);
-                    return;
-                } catch (Exception e) {
-                    Log.e(TAG, "Auto-reply failed", e);
-                }
-            }
-        }
-        Log.w(TAG, "No reply action found in notification");
     }
 }
