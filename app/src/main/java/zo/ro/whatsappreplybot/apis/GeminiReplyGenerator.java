@@ -1,136 +1,132 @@
 package zo.ro.whatsappreplybot.apis;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.util.Log;
 
-import androidx.annotation.NonNull;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
-import com.google.ai.client.generativeai.GenerativeModel;
-import com.google.ai.client.generativeai.java.GenerativeModelFutures;
-import com.google.ai.client.generativeai.type.Content;
-import com.google.ai.client.generativeai.type.GenerateContentResponse;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
-
+import java.io.IOException;
 import java.util.List;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
-import zo.ro.whatsappreplybot.R;
-import zo.ro.whatsappreplybot.helpers.WhatsAppMessageHandler;
-import zo.ro.whatsappreplybot.models.Message;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import zo.ro.whatsappreplybot.helpers.DatabaseHelper;
+import zo.ro.whatsappreplybot.helpers.MemoryManager;
+import zo.ro.whatsappreplybot.models.ChatMessage;
+import zo.ro.whatsappreplybot.models.ChatSession;
 
 public class GeminiReplyGenerator {
 
-    private static final String TAG = "MADARA";
-    private final String API_KEY;
-    private final String LLM_MODEL;
-    private final WhatsAppMessageHandler messageHandler;
-    private final String defaultReplyMessage;
-    private final String aiReplyLanguage;
-    private final String botName;
+    private static final String TAG = "GeminiReply";
 
-    public GeminiReplyGenerator(Context context, SharedPreferences sharedPreferences, WhatsAppMessageHandler whatsAppMessageHandler) {
-        this.messageHandler = whatsAppMessageHandler;
-        API_KEY = sharedPreferences.getString("api_key", "not-set").trim();
-        LLM_MODEL = sharedPreferences.getString("llm_model", "gemini-1.5-flash");
-        defaultReplyMessage = sharedPreferences.getString("default_reply_message", context.getString(R.string.default_bot_message));
-        aiReplyLanguage = sharedPreferences.getString("ai_reply_language", "English");
-        botName = sharedPreferences.getString("bot_name", "Yuji");
+    public interface ReplyCallback {
+        void onReply(String reply);
+        void onError(String error);
     }
 
-    public void generateReply(String sender, String message, CustomReplyGenerator.OnReplyGeneratedListener listener) {
+    private final Context        context;
+    private final String         apiKey;
+    private final OkHttpClient   client;
+    private final DatabaseHelper db;
+    private final MemoryManager  memory;
 
-        messageHandler.getMessagesHistory(sender, messages -> {
+    public GeminiReplyGenerator(Context context, String apiKey) {
+        this.context = context;
+        this.apiKey  = apiKey;
+        this.db      = DatabaseHelper.getInstance(context);
+        this.memory  = MemoryManager.getInstance(context);
+        this.client  = new OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .build();
+    }
 
-            StringBuilder chatHistory = getChatHistory(messages);
-            StringBuilder prompt = buildPrompt(sender, message, chatHistory);
+    public void generateReply(String sender, String message, ReplyCallback callback) {
+        try {
+            long contactId      = db.getOrCreateContact(sender, "whatsapp");
+            ChatSession session = db.getOrCreateActiveSession(contactId, memory.getMaxMessages());
+            List<ChatMessage> history = db.getRecentMessages(
+                    session.getId(), memory.getHistorySize());
 
-            GenerativeModel gm = new GenerativeModel(LLM_MODEL, API_KEY);
-            GenerativeModelFutures model = GenerativeModelFutures.from(gm);
+            // Build prompt
+            StringBuilder prompt = new StringBuilder();
+            prompt.append(db.buildAdminMemoryBlock()).append("\n");
+            prompt.append(db.buildActiveRulesBlock()).append("\n");
+            prompt.append("Chat history:\n");
+            for (ChatMessage m : history) {
+                prompt.append(m.getSenderName()).append(": ").append(m.getMessageText()).append("\n");
+                if (m.getAiReply() != null) prompt.append("You: ").append(m.getAiReply()).append("\n");
+            }
+            prompt.append(sender).append(": ").append(message).append("\nYour reply:");
 
-            Content content = new Content.Builder()
-                    .addText(prompt.toString())
+            JSONObject part = new JSONObject();
+            part.put("text", prompt.toString());
+
+            JSONArray parts = new JSONArray();
+            parts.put(part);
+
+            JSONObject content = new JSONObject();
+            content.put("parts", parts);
+
+            JSONArray contents = new JSONArray();
+            contents.put(content);
+
+            JSONObject body = new JSONObject();
+            body.put("contents", contents);
+
+            String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                    + "gemini-pro:generateContent?key=" + apiKey;
+
+            RequestBody reqBody = RequestBody.create(
+                    body.toString(),
+                    MediaType.parse("application/json; charset=utf-8"));
+
+            Request request = new Request.Builder()
+                    .url(url)
+                    .addHeader("Content-Type", "application/json")
+                    .post(reqBody)
                     .build();
 
-            Executor executor = Executors.newSingleThreadExecutor();
-
-            ListenableFuture<GenerateContentResponse> response = model.generateContent(content);
-            Futures.addCallback(response, new FutureCallback<GenerateContentResponse>() {
+            client.newCall(request).enqueue(new Callback() {
                 @Override
-                public void onSuccess(GenerateContentResponse result) {
-                    String resultText = result.getText();
-                    listener.onReplyGenerated(resultText);
-                    Log.d(TAG, "onSuccess: " + resultText);
+                public void onFailure(Call call, IOException e) {
+                    callback.onError("Network error: " + e.getMessage());
                 }
 
                 @Override
-                public void onFailure(@NonNull Throwable t) {
-                    listener.onReplyGenerated(defaultReplyMessage);
-                    Log.e(TAG, "onFailure: ", t);
+                public void onResponse(Call call, Response response) throws IOException {
+                    String bodyStr = response.body() != null ? response.body().string() : "";
+                    if (!response.isSuccessful()) {
+                        callback.onError("API error " + response.code());
+                        return;
+                    }
+                    try {
+                        JSONObject json = new JSONObject(bodyStr);
+                        String reply = json
+                                .getJSONArray("candidates")
+                                .getJSONObject(0)
+                                .getJSONObject("content")
+                                .getJSONArray("parts")
+                                .getJSONObject(0)
+                                .getString("text")
+                                .trim();
+                        callback.onReply(reply);
+                    } catch (Exception e) {
+                        callback.onError("Parse error: " + e.getMessage());
+                    }
                 }
-            }, executor);
-        });
-    }
+            });
 
-//    ----------------------------------------------------------------------------------------------
-
-    private @NonNull StringBuilder buildPrompt(String sender, String message, StringBuilder chatHistory) {
-
-        StringBuilder prompt = new StringBuilder();
-
-        if (!chatHistory.toString().isEmpty()) {
-            prompt.append("You are a WhatsApp auto-reply bot named ").append(botName);
-            prompt.append(" who pretends to be human and doesn't disclose that you are a bot.");
-            prompt.append(" Give appropriate replies according to the latest message and the previous chat history.");
-            prompt.append(" Generate only reply texts. Don't add any other texts.");
-            prompt.append(" Always reply in ").append(aiReplyLanguage).append(".");
-            prompt.append(" Reply within 1 or 2 sentences whenever possible.");
-            prompt.append(" Be polite, context-aware, and ensure your replies are relevant to the conversation.");
-            prompt.append("\n\n\nMost recent message (from ");
-            prompt.append(sender).append("): ");
-            prompt.append(message);
-            prompt.append("\n\n\nPrevious chat history: \n").append(chatHistory);
-            return prompt;
+        } catch (Exception e) {
+            Log.e(TAG, "Error", e);
+            callback.onError("Error: " + e.getMessage());
         }
-
-        prompt.append("You are a WhatsApp auto-reply bot named ").append(botName);
-        prompt.append("Your task is replying to the incoming message. ");
-        prompt.append("Always reply in ").append(aiReplyLanguage);
-        prompt.append(". Be polite, context-aware, and ensure your replies are relevant to the conversation.\n\n");
-        prompt.append("\n\n\nIncoming message (from ");
-        prompt.append(sender).append("): ");
-        prompt.append(message);
-        return prompt;
     }
-
-//    ----------------------------------------------------------------------------------------------
-
-    private @NonNull StringBuilder getChatHistory(List<Message> messages) {
-
-        StringBuilder chatHistory = new StringBuilder();
-
-        if (!messages.isEmpty()) {
-
-            for (Message msg : messages) {
-
-                String senderName = msg.getSender();
-                String senderMessage = msg.getMessage();
-                String senderMessageTimestamp = msg.getTimestamp();
-                String myReplyToSenderMessage = msg.getReply();
-
-                chatHistory.append(senderName).append(": ").append(senderMessage);
-                chatHistory.append("\n");
-                chatHistory.append("Time: ").append(senderMessageTimestamp);
-                chatHistory.append("\n");
-                chatHistory.append("My reply: ").append(myReplyToSenderMessage);
-                chatHistory.append("\n\n");
-            }
-        }
-        return chatHistory;
-    }
-
-//    ----------------------------------------------------------------------------------------------
 }
